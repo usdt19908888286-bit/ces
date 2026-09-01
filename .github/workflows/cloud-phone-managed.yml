@@ -1,0 +1,532 @@
+name: Managed Android Cloud Phone
+run-name: ${{ inputs.phone_name || 'Managed Phone' }} · ${{ inputs.phone_id || '001' }} / ${{ inputs.mode || 'new' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Create a new phone or restore the latest encrypted backup
+        required: true
+        default: new
+        type: choice
+        options:
+          - new
+          - restore
+      phone_id:
+        description: Logical phone ID (digits only, e.g. 001)
+        required: true
+        default: '001'
+        type: string
+      phone_name:
+        description: Friendly phone name shown in GitHub and the local GUI
+        required: false
+        default: 'BICOIN-001'
+        type: string
+      package_name:
+        description: Android package used for GUI monitoring/launch only; it is not auto-installed
+        required: false
+        default: 'com.temperaturecoin'
+        type: string
+      apk_url:
+        description: Optional APK reference only; managed phone creation does not auto-install APKs
+        required: false
+        default: 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk'
+        type: string
+      api_level:
+        description: Android API level
+        required: false
+        default: '35'
+        type: string
+      target:
+        description: Android system image target
+        required: false
+        default: 'google_apis'
+        type: string
+      arch:
+        description: Android emulator architecture
+        required: false
+        default: 'x86_64'
+        type: string
+      profile:
+        description: Android device profile
+        required: false
+        default: 'pixel_6'
+        type: string
+      cores:
+        description: Emulator CPU cores
+        required: false
+        default: '4'
+        type: string
+      ram_mb:
+        description: Emulator RAM in MiB
+        required: false
+        default: '8192'
+        type: string
+      device_manufacturer:
+        description: Optional Android Build.MANUFACTURER value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+      device_brand:
+        description: Optional Android Build.BRAND value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+      device_model:
+        description: Optional Android Build.MODEL value for emulator compatibility testing
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: managed-android-phone-${{ inputs.phone_id || '001' }}
+  cancel-in-progress: true
+
+env:
+  DISPLAY: :99
+  APK_URL: ${{ inputs.apk_url || 'https://github.com/usdt19908888286-bit/android-test/releases/download/cloud-phone-apk-cache/app-release.apk' }}
+  PHONE_ID: ${{ inputs.phone_id || '001' }}
+  PHONE_NAME: ${{ inputs.phone_name || 'BICOIN-001' }}
+  PACKAGE_NAME: ${{ inputs.package_name || 'com.temperaturecoin' }}
+  AVD_NAME: managed-phone-${{ inputs.phone_id || '001' }}
+  DEVICE_MANUFACTURER: ${{ inputs.device_manufacturer || '' }}
+  DEVICE_BRAND: ${{ inputs.device_brand || '' }}
+  DEVICE_MODEL: ${{ inputs.device_model || '' }}
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      AVD_BACKUP_KEY: ${{ secrets.AVD_BACKUP_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and backup encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PHONE_ID" in
+            ''|*[!0-9]*) echo '::error::phone_id must contain digits only'; exit 1 ;;
+          esac
+          [[ "${PACKAGE_NAME:-}" =~ ^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$ ]] || { echo '::error::package_name is invalid'; exit 1; }
+          [[ "${DEVICE_MANUFACTURER:-}" =~ ^[A-Za-z0-9._+ -]*$ ]] || { echo '::error::device_manufacturer contains unsupported characters'; exit 1; }
+          [[ "${DEVICE_BRAND:-}" =~ ^[A-Za-z0-9._+-]*$ ]] || { echo '::error::device_brand contains unsupported characters'; exit 1; }
+          [[ "${DEVICE_MODEL:-}" =~ ^[A-Za-z0-9._+() -]*$ ]] || { echo '::error::device_model contains unsupported characters'; exit 1; }
+          if [ -n "${DEVICE_MODEL:-}" ] && { [ -z "${DEVICE_MANUFACTURER:-}" ] || [ -z "${DEVICE_BRAND:-}" ]; }; then
+            echo '::error::device_model requires device_manufacturer and device_brand'
+            exit 1
+          fi
+          if [ "${{ inputs.mode }}" = 'restore' ] && [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::error::AVD_BACKUP_KEY repository secret is required to restore an encrypted backup.'
+            exit 1
+          fi
+          if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+            echo '::warning::AVD_BACKUP_KEY is not initialized yet. New phone may run, but backup is disabled until the secret is created.'
+          fi
+          echo "MANAGED_PHONE_MODE=${{ inputs.mode }}"
+
+      - name: Prepare phone identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          SLUG=$(printf '%s' "${PHONE_NAME:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//' | cut -c1-35)
+          [ -n "$SLUG" ] || SLUG="managed-phone${PHONE_ID}"
+          echo "ts_hostname=${SLUG}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "PHONE_DISPLAY_NAME=${PHONE_NAME}"
+
+      - name: Join Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_API_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_API_CLIENT_SECRET }}
+          tags: tag:github-phone
+          hostname: ${{ steps.identity.outputs.ts_hostname }}
+          version: latest
+
+      - name: Enable KVM and install runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -e /dev/kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb netcat-openbsd curl unzip libpulse0 zstd openssl jq
+          Xvfb :99 -screen 0 1280x720x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+
+      - name: Verify direct Internet
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --connect-timeout 12 --max-time 25 https://www.cloudflare.com/cdn-cgi/trace -o /dev/null
+          echo 'DIRECT_NETWORK_OK'
+
+      - name: Restore latest encrypted AVD backup
+        if: inputs.mode == 'restore'
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-restore-${{ github.run_id }}
+          restore-keys: |
+            managed-avd-${{ inputs.phone_id }}-
+
+      - name: Decrypt restored AVD
+        if: inputs.mode == 'restore'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${{ steps.cache-restore.outputs.cache-matched-key }}" ] || {
+            echo '::error::No encrypted AVD backup exists for this phone_id.'
+            exit 1
+          }
+          ENC_FILE=$(find /tmp/managed-avd-backup -maxdepth 1 -type f -name '*.enc' | head -n1)
+          [ -n "$ENC_FILE" ] && [ -s "$ENC_FILE" ]
+          mkdir -p "$HOME/.android"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY -in "$ENC_FILE" -out /tmp/managed-avd.tar.zst
+          zstd -d -q -c /tmp/managed-avd.tar.zst | tar -xf - -C "$HOME/.android"
+          rm -f /tmp/managed-avd.tar.zst
+          test -f "$HOME/.android/avd/${AVD_NAME}.ini"
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          echo "RESTORED_CACHE_KEY=${{ steps.cache-restore.outputs.cache-matched-key }}"
+          echo 'MANAGED_AVD_DECRYPT_RESTORE_OK'
+
+      - name: Prepare runner status service
+        shell: bash
+        run: |
+          cat >/tmp/runner_status_server.py <<'PY'
+          import http.server, json, os, subprocess, time
+
+          RUN_ID = os.environ.get('GITHUB_RUN_ID', '')
+          PHONE_ID = os.environ.get('PHONE_ID', '')
+
+          def cpu_sample():
+              def snap():
+                  with open('/proc/stat', 'r', encoding='utf-8') as f:
+                      vals = [int(x) for x in f.readline().split()[1:]]
+                  idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                  return sum(vals), idle
+              a_total, a_idle = snap(); time.sleep(0.20); b_total, b_idle = snap()
+              total = max(1, b_total - a_total)
+              return round(100.0 * (1.0 - (b_idle - a_idle) / total), 1)
+
+          def mem_sample():
+              vals = {}
+              with open('/proc/meminfo', 'r', encoding='utf-8') as f:
+                  for line in f:
+                      k, v = line.split(':', 1)
+                      vals[k] = int(v.strip().split()[0])
+              total = vals.get('MemTotal', 0)
+              avail = vals.get('MemAvailable', 0)
+              used = max(0, total - avail)
+              pct = round(100.0 * used / total, 1) if total else 0
+              return total, used, avail, pct
+
+          def qemu_sample():
+              cp = subprocess.run(
+                  ['ps', '-C', 'qemu-system-x86_64', '-o', '%cpu=,%mem=,rss=,pid=', '--sort=-%cpu'],
+                  capture_output=True, text=True
+              )
+              line = next((x.strip() for x in cp.stdout.splitlines() if x.strip()), '')
+              if not line:
+                  return {'cpu_percent': 0.0, 'mem_percent': 0.0, 'rss_kib': 0, 'pid': None}
+              parts = line.split()
+              try:
+                  return {
+                      'cpu_percent': float(parts[0]),
+                      'mem_percent': float(parts[1]),
+                      'rss_kib': int(parts[2]),
+                      'pid': int(parts[3]),
+                  }
+              except Exception:
+                  return {'raw': line}
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path not in ('/', '/status'):
+                      self.send_response(404); self.end_headers(); return
+                  total, used, avail, pct = mem_sample()
+                  load = os.getloadavg()
+                  data = {
+                      'ok': True,
+                      'run_id': RUN_ID,
+                      'phone_id': PHONE_ID,
+                      'cpu_percent': cpu_sample(),
+                      'load1': round(load[0], 2),
+                      'load5': round(load[1], 2),
+                      'load15': round(load[2], 2),
+                      'mem_total_kib': total,
+                      'mem_used_kib': used,
+                      'mem_available_kib': avail,
+                      'mem_percent': pct,
+                      'qemu': qemu_sample(),
+                  }
+                  body = json.dumps(data).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers(); self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          http.server.ThreadingHTTPServer(('127.0.0.1', 8787), Handler).serve_forever()
+          PY
+          nohup python3 /tmp/runner_status_server.py >/tmp/runner-status.log 2>&1 &
+          sleep 1
+          curl -fsS http://127.0.0.1:8787/status >/tmp/runner-status-probe.json
+          sudo -E tailscale serve --bg --yes --tcp=8787 tcp://127.0.0.1:8787
+          echo 'RUNNER_STATUS_READY=8787'
+
+      - name: Prepare managed Android bootstrap script
+        shell: bash
+        run: |
+          cat >/tmp/managed-phone.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          wait_android_boot() {
+            adb wait-for-device
+            for _ in $(seq 1 180); do
+              [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = '1' ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          echo 'MANAGED_AVD_BOOT_WAIT'
+          wait_android_boot
+          echo 'MANAGED_AVD_BOOT_COMPLETE'
+
+          # Optional Build identity for emulator compatibility testing. Android Emulator
+          # does not allow arbitrary ro.product.* values through -prop, so use the
+          # writable-system/remount development path and verify after reboot.
+          if [ -n "${DEVICE_MODEL:-}" ]; then
+            echo "DEVICE_IDENTITY_TARGET=${DEVICE_MANUFACTURER}|${DEVICE_BRAND}|${DEVICE_MODEL}"
+            IDENTITY_READY=0
+            if adb root >/tmp/adb-root.log 2>&1; then
+              adb wait-for-device
+              sleep 2
+              if adb remount >/tmp/adb-remount.log 2>&1; then
+                IDENTITY_READY=1
+              else
+                adb disable-verity >/tmp/adb-disable-verity.log 2>&1 || true
+                adb reboot || true
+                if wait_android_boot; then
+                  adb root >/tmp/adb-root2.log 2>&1 || true
+                  adb wait-for-device
+                  sleep 2
+                  if adb remount >/tmp/adb-remount2.log 2>&1; then
+                    IDENTITY_READY=1
+                  fi
+                fi
+              fi
+            fi
+
+            if [ "$IDENTITY_READY" = '1' ]; then
+              cat >/tmp/patch-device-identity.sh <<'DEVICEPATCH'
+          #!/system/bin/sh
+          set -eu
+          patch_prop() {
+            key="$1"
+            value="$2"
+            file="$3"
+            [ -f "$file" ] || return 0
+            if grep -q "^${key}=" "$file" 2>/dev/null; then
+              sed -i "s|^${key}=.*|${key}=${value}|g" "$file"
+            fi
+          }
+          for file in             /system/build.prop /system/system/build.prop             /product/build.prop /system/product/build.prop             /vendor/build.prop /system/vendor/build.prop             /odm/build.prop /system/odm/build.prop             /system_ext/build.prop /system/system_ext/build.prop; do
+            for suffix in '' '.system' '.product' '.vendor' '.odm' '.system_ext'; do
+              patch_prop "ro.product${suffix}.manufacturer" "$TARGET_MANUFACTURER" "$file"
+              patch_prop "ro.product${suffix}.brand" "$TARGET_BRAND" "$file"
+              patch_prop "ro.product${suffix}.model" "$TARGET_MODEL" "$file"
+            done
+          done
+          sync
+          DEVICEPATCH
+              adb push /tmp/patch-device-identity.sh /data/local/tmp/patch-device-identity.sh >/dev/null
+              adb shell chmod 700 /data/local/tmp/patch-device-identity.sh
+              if adb shell "TARGET_MANUFACTURER='${DEVICE_MANUFACTURER}' TARGET_BRAND='${DEVICE_BRAND}' TARGET_MODEL='${DEVICE_MODEL}' sh /data/local/tmp/patch-device-identity.sh"; then
+                adb reboot || true
+                wait_android_boot
+              fi
+            else
+              echo '::warning::Could not remount emulator system; continuing with stock AVD identity.'
+            fi
+
+            ACTUAL_MANUFACTURER=$(adb shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r')
+            ACTUAL_BRAND=$(adb shell getprop ro.product.brand 2>/dev/null | tr -d '\r')
+            ACTUAL_MODEL=$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')
+            echo "DEVICE_IDENTITY_ACTUAL=${ACTUAL_MANUFACTURER}|${ACTUAL_BRAND}|${ACTUAL_MODEL}"
+            if [ "$ACTUAL_MODEL" = "$DEVICE_MODEL" ]; then
+              echo 'DEVICE_REAL_MODEL_APPLIED'
+            else
+              echo "::warning::Requested model '${DEVICE_MODEL}', but Android reports '${ACTUAL_MODEL}'."
+            fi
+          fi
+
+          # Fresh Android often needs a short settling period before first app launch.
+          sleep 12
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell settings put global disable_window_blurs 1 || true
+          adb shell settings put system peak_refresh_rate 60.0 || true
+          adb shell settings put system min_refresh_rate 60.0 || true
+          adb shell wm size 720x1600 || true
+          adb shell wm density 280 || true
+
+          # Phone creation/restoration is intentionally APK-neutral. The GUI may
+          # remember a package name for monitoring, but this workflow never downloads,
+          # installs, or auto-launches an APK.
+          DEFAULT_PACKAGE="$PACKAGE_NAME"
+          if adb shell pm path "$DEFAULT_PACKAGE" >/dev/null 2>&1; then
+            echo "MONITORED_APP_PRESENT=$DEFAULT_PACKAGE"
+          else
+            echo "MONITORED_APP_NOT_INSTALLED=$DEFAULT_PACKAGE"
+          fi
+          echo 'MANAGED_PHONE_APK_NEUTRAL'
+
+          adb shell pm disable-user --user 0 com.android.vending >/dev/null 2>&1 || true
+          adb shell settings put global auto_update_system_apps 0 || true
+
+          echo 'ADB_TCPIP_BOOTSTRAP_START'
+          adb tcpip 5555 >/tmp/adb-tcpip.log 2>&1 || { cat /tmp/adb-tcpip.log; exit 1; }
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 5555 && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 5555
+          echo 'ADB_TCPIP_5555_READY'
+
+          TS_IPV4=$(tailscale ip -4 | head -n1)
+          [ -n "$TS_IPV4" ]
+          sudo -E tailscale serve --bg --yes --tcp=5555 tcp://127.0.0.1:5555
+          echo 'MANAGED_CLOUD_PHONE_READY'
+          echo "TAILSCALE_ADB=${TS_IPV4}:5555"
+          echo "RUNNER_STATUS=http://${TS_IPV4}:8787/status"
+          echo "SCRCPY_CONNECT=adb connect ${TS_IPV4}:5555 && scrcpy -s ${TS_IPV4}:5555"
+
+          COMMAND_TITLE="Cloud Phone Command ${PHONE_ID}"
+          for _ in $(seq 1 1800); do
+            ISSUE_LINE=$(gh api "/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == \"${COMMAND_TITLE}\") | [.number,.body] | @tsv" \
+              2>/dev/null | head -n1 || true)
+            if [ -n "$ISSUE_LINE" ]; then
+              ISSUE_NO=${ISSUE_LINE%%$'\t'*}
+              ISSUE_BODY=${ISSUE_LINE#*$'\t'}
+              CMD_JSON=$(printf '%s\n' "$ISSUE_BODY" | grep -m1 '^{' || true)
+              if [ -n "$CMD_JSON" ]; then
+                CMD=$(jq -r '.command // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_RUN=$(jq -r '.run_id // 0' <<<"$CMD_JSON" 2>/dev/null || true)
+                TARGET_PHONE=$(jq -r '.phone_id // ""' <<<"$CMD_JSON" 2>/dev/null || true)
+                if [ "$CMD" = 'backup' ] && [ "$TARGET_RUN" = "$GITHUB_RUN_ID" ] && [ "$TARGET_PHONE" = "$PHONE_ID" ]; then
+                  if [ -z "${AVD_BACKUP_KEY:-}" ]; then
+                    echo 'BACKUP_REQUEST_REJECTED_NO_KEY'
+                  else
+                    echo "BACKUP_REQUEST_RECEIVED issue=${ISSUE_NO}"
+                    printf '%s' "$ISSUE_NO" >/tmp/managed-backup-issue-number
+                    touch /tmp/managed-backup-requested
+                    adb shell sync || true
+                    exit 0
+                  fi
+                fi
+              fi
+            fi
+            sleep 10
+          done
+
+          # End-of-life safety backup when the 5-hour session naturally expires.
+          if [ -n "${AVD_BACKUP_KEY:-}" ]; then
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP'
+            touch /tmp/managed-backup-requested
+            adb shell sync || true
+          else
+            echo 'SESSION_TIMEOUT_AUTO_BACKUP_SKIPPED_NO_KEY'
+          fi
+          SCRIPT
+          chmod +x /tmp/managed-phone.sh
+          bash -n /tmp/managed-phone.sh
+          echo 'MANAGED_BOOTSTRAP_SCRIPT_READY'
+
+      - name: Start managed Android phone
+        id: android
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          PHONE_MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          api-level: ${{ inputs.api_level }}
+          target: ${{ inputs.target }}
+          arch: ${{ inputs.arch }}
+          profile: ${{ inputs.profile }}
+          avd-name: managed-phone-${{ inputs.phone_id || '001' }}
+          cores: ${{ inputs.cores }}
+          ram-size: ${{ format('{0}M', inputs.ram_mb) }}
+          force-avd-creation: ${{ inputs.mode == 'new' }}
+          disable-animations: false
+          emulator-options: >-
+            -no-snapshot
+            ${{ inputs.device_model != '' && '-writable-system' || '' }}
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+          script: bash /tmp/managed-phone.sh
+
+      - name: Pack and encrypt full AVD backup
+        id: pack
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/managed-backup-requested ]; then
+            echo 'should_save=false' >> "$GITHUB_OUTPUT"
+            echo 'NO_BACKUP_REQUEST'
+            exit 0
+          fi
+          test -d "$HOME/.android/avd/${AVD_NAME}.avd"
+          mkdir -p /tmp/managed-avd-backup
+          rm -f /tmp/managed-avd-backup/*
+          tar --sparse -cf - -C "$HOME/.android" avd | zstd -T0 -3 -q -o /tmp/managed-avd.tar.zst
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 \
+            -pass env:AVD_BACKUP_KEY \
+            -in /tmp/managed-avd.tar.zst \
+            -out "/tmp/managed-avd-backup/phone-${PHONE_ID}-run-${GITHUB_RUN_ID}.tar.zst.enc"
+          rm -f /tmp/managed-avd.tar.zst
+          BYTES=$(stat -c '%s' /tmp/managed-avd-backup/*.enc)
+          echo "ENCRYPTED_BACKUP_BYTES=$BYTES"
+          echo 'should_save=true' >> "$GITHUB_OUTPUT"
+          echo 'FULL_AVD_ENCRYPTED_BACKUP_READY'
+
+      - name: Save encrypted AVD backup to GitHub Actions Cache
+        if: steps.pack.outputs.should_save == 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: /tmp/managed-avd-backup
+          key: managed-avd-${{ inputs.phone_id }}-${{ github.run_id }}
+
+      - name: Close consumed backup command
+        if: steps.pack.outputs.should_save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -s /tmp/managed-backup-issue-number ]; then
+            ISSUE_NO=$(cat /tmp/managed-backup-issue-number)
+            gh issue close "$ISSUE_NO" --repo "$GITHUB_REPOSITORY" --comment "Backup saved successfully from run $GITHUB_RUN_ID." || true
+          fi
+          echo 'MANAGED_BACKUP_SAVED'
